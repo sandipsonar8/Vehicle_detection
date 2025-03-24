@@ -1,14 +1,14 @@
 package com.rdxindia.vehicle_ditection
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
-import android.location.Location
-import android.location.LocationManager
+import android.graphics.Matrix
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
-import androidx.core.content.ContextCompat
+import android.widget.Toast
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.common.FileUtil
@@ -19,7 +19,8 @@ import org.tensorflow.lite.support.image.TensorImage
 import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
 import java.io.*
 import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Date
+import java.util.Locale
 
 class Detector(
     private val context: Context,
@@ -43,31 +44,25 @@ class Detector(
 
     fun setup() {
         val model = FileUtil.loadMappedFile(context, modelPath)
-        val options = Interpreter.Options()
-        options.setUseNNAPI(true)  // Enable Neural Networks API for acceleration
-        options.setNumThreads(4)   // Increase number of threads
+        val options = Interpreter.Options().apply {
+            setUseNNAPI(true)
+            setNumThreads(4)
+        }
         interpreter = Interpreter(model, options)
 
-        val inputShape = interpreter?.getInputTensor(0)?.shape() ?: return
-        val outputShape = interpreter?.getOutputTensor(0)?.shape() ?: return
-
-        tensorWidth = inputShape[1]
-        tensorHeight = inputShape[2]
-        numChannel = outputShape[1]
-        numElements = outputShape[2]
+        interpreter?.getInputTensor(0)?.shape()?.let {
+            tensorWidth = it[1]
+            tensorHeight = it[2]
+        }
+        interpreter?.getOutputTensor(0)?.shape()?.let {
+            numChannel = it[1]
+            numElements = it[2]
+        }
 
         try {
-            val inputStream: InputStream = context.assets.open(labelPath)
-            val reader = BufferedReader(InputStreamReader(inputStream))
-
-            var line: String? = reader.readLine()
-            while (line != null && line != "") {
-                labels.add(line)
-                line = reader.readLine()
+            context.assets.open(labelPath).bufferedReader().useLines { lines ->
+                labels.addAll(lines.filter { it.isNotEmpty() })
             }
-
-            reader.close()
-            inputStream.close()
         } catch (e: IOException) {
             e.printStackTrace()
         }
@@ -82,12 +77,10 @@ class Detector(
         interpreter ?: return
         if (tensorWidth == 0 || tensorHeight == 0 || numChannel == 0 || numElements == 0) return
 
-        var inferenceTime = SystemClock.uptimeMillis()
+        val startTime = SystemClock.uptimeMillis()
 
         val resizedBitmap = Bitmap.createScaledBitmap(frame, tensorWidth, tensorHeight, false)
-
-        val tensorImage = TensorImage(DataType.FLOAT32)
-        tensorImage.load(resizedBitmap)
+        val tensorImage = TensorImage(DataType.FLOAT32).apply { load(resizedBitmap) }
         val processedImage = imageProcessor.process(tensorImage)
         val imageBuffer = processedImage.buffer
 
@@ -95,7 +88,7 @@ class Detector(
         interpreter?.run(imageBuffer, output.buffer)
 
         val bestBoxes = bestBox(output.floatArray)
-        inferenceTime = SystemClock.uptimeMillis() - inferenceTime
+        val inferenceTime = SystemClock.uptimeMillis() - startTime
 
         if (bestBoxes == null) {
             detectorListener.onEmptyDetect()
@@ -104,56 +97,73 @@ class Detector(
 
         detectorListener.onDetect(bestBoxes, inferenceTime)
 
-        // If "vehicle_truck" or "bus" is detected, capture and save image
         for (box in bestBoxes) {
-            if (box.clsName == "truck" || box.clsName == "bus") {
-                captureAndSaveImage(frame)
-                break // Save only once per frame
+            if (box.clsName in listOf("truck", "bus", "van")) {
+                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+
+                captureAndSaveImage(frame, timestamp, false)
+
+                Handler(Looper.getMainLooper()).postDelayed({
+                    val zoomedFrame = getZoomedBitmap(frame, box)
+                    captureAndSaveImage(zoomedFrame, timestamp, true)
+                }, 4000)
+
+                break
             }
         }
     }
 
-    private fun bestBox(array: FloatArray): List<BoundingBox>? {
-        val boundingBoxes = mutableListOf<BoundingBox>()
+    private fun getZoomedBitmap(original: Bitmap, box: BoundingBox): Bitmap {
+        val width = original.width
+        val height = original.height
 
-        for (c in 0 until numElements) {
-            var maxConf = -1.0f
-            var maxIdx = -1
-            var j = 4
-            var arrayIdx = c + numElements * j
-            while (j < numChannel) {
-                if (array[arrayIdx] > maxConf) {
-                    maxConf = array[arrayIdx]
-                    maxIdx = j - 4
-                }
-                j++
-                arrayIdx += numElements
-            }
+        val x1 = (box.x1 * width).toInt().coerceIn(0, width - 1)
+        val y1 = (box.y1 * height).toInt().coerceIn(0, height - 1)
+        val x2 = (box.x2 * width).toInt().coerceIn(0, width - 1)
+        val y2 = (box.y2 * height).toInt().coerceIn(0, height - 1)
 
-            if (maxConf > CONFIDENCE_THRESHOLD) {
-                val clsName = labels[maxIdx]
-                val cx = array[c] // 0
-                val cy = array[c + numElements] // 1
-                val w = array[c + numElements * 2]
-                val h = array[c + numElements * 3]
-                val x1 = cx - (w / 2F)
-                val y1 = cy - (h / 2F)
-                val x2 = cx + (w / 2F)
-                val y2 = cy + (h / 2F)
-                if (x1 < 0F || x1 > 1F || y1 < 0F || y1 > 1F || x2 < 0F || x2 > 1F || y2 < 0F || y2 > 1F) continue
+        val cropWidth = (x2 - x1).coerceAtLeast(1)
+        val cropHeight = (y2 - y1).coerceAtLeast(1)
 
-                boundingBoxes.add(
-                    BoundingBox(x1, y1, x2, y2, cx, cy, w, h, maxConf, maxIdx, clsName)
-                )
-            }
-        }
+        val croppedBitmap = Bitmap.createBitmap(original, x1, y1, cropWidth, cropHeight)
 
-        if (boundingBoxes.isEmpty()) return null
-
-        return applyNMS(boundingBoxes)
+        return upscaleImage(croppedBitmap, width, height)
     }
 
-    private fun applyNMS(boxes: List<BoundingBox>): MutableList<BoundingBox> {
+    private fun upscaleImage(bitmap: Bitmap, newWidth: Int, newHeight: Int): Bitmap {
+        val matrix = Matrix().apply {
+            postScale(
+                newWidth.toFloat() / bitmap.width,
+                newHeight.toFloat() / bitmap.height
+            )
+        }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+
+    private fun captureAndSaveImage(bitmap: Bitmap, timestamp: String, isZoomed: Boolean) {
+        val storageDir = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
+            "VehicleDetections"
+        )
+        if (!storageDir.exists()) storageDir.mkdirs()
+
+        val fileName = if (isZoomed) "IMG_${timestamp}_zoom.jpg" else "IMG_${timestamp}.jpg"
+        val file = File(storageDir, fileName)
+
+        FileOutputStream(file).use { fos ->
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 100, fos)
+            fos.flush()
+        }
+
+        Log.d("Capture", "Image saved: ${file.absolutePath}")
+
+        Handler(Looper.getMainLooper()).post {
+            val msg = if (isZoomed) "Zoomed image saved ✅" else "Original image saved ✅"
+            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun applyNMS(boxes: List<BoundingBox>): List<BoundingBox> {
         val sortedBoxes = boxes.sortedByDescending { it.cnf }.toMutableList()
         val selectedBoxes = mutableListOf<BoundingBox>()
 
@@ -186,20 +196,44 @@ class Detector(
         return intersectionArea / (box1Area + box2Area - intersectionArea)
     }
 
-    private fun captureAndSaveImage(bitmap: Bitmap) {
-        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-        val storageDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "VehicleDetections")
-        if (!storageDir.exists()) storageDir.mkdirs()
 
-        val file = File(storageDir, "IMG_$timestamp.jpg")
-        val fos = FileOutputStream(file)
+    private fun bestBox(array: FloatArray): List<BoundingBox>? {
+        val boundingBoxes = mutableListOf<BoundingBox>()
 
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 100, fos)
-        fos.flush()
-        fos.close()
+        for (c in 0 until numElements) {
+            var maxConf = -1.0f
+            var maxIdx = -1
+            for (j in 4 until numChannel) {
+                val arrayIdx = c + numElements * j
+                if (array[arrayIdx] > maxConf) {
+                    maxConf = array[arrayIdx]
+                    maxIdx = j - 4
+                }
+            }
 
-        Log.d("Capture", "Image saved: ${file.absolutePath}")
+            if (maxConf > CONFIDENCE_THRESHOLD) {
+                val clsName = labels[maxIdx]
+                val cx = array[c]
+                val cy = array[c + numElements]
+                val w = array[c + numElements * 2]
+                val h = array[c + numElements * 3]
+                val x1 = cx - (w / 2F)
+                val y1 = cy - (h / 2F)
+                val x2 = cx + (w / 2F)
+                val y2 = cy + (h / 2F)
+
+                if (x1 in 0F..1F && y1 in 0F..1F && x2 in 0F..1F && y2 in 0F..1F) {
+                    boundingBoxes.add(
+                        BoundingBox(x1, y1, x2, y2, cx, cy, w, h, maxConf, maxIdx, clsName)
+                    )
+                }
+            }
+        }
+
+        return if (boundingBoxes.isEmpty()) null else applyNMS(boundingBoxes)
     }
+
+
 
     interface DetectorListener {
         fun onEmptyDetect()
@@ -212,6 +246,6 @@ class Detector(
         private val INPUT_IMAGE_TYPE = DataType.FLOAT32
         private val OUTPUT_IMAGE_TYPE = DataType.FLOAT32
         private const val CONFIDENCE_THRESHOLD = 0.5F
-        private const val IOU_THRESHOLD = 0.5F
+        private const val IOU_THRESHOLD = 0.4F
     }
 }
